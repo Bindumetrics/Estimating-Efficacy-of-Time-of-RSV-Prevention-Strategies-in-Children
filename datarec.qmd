@@ -1,0 +1,435 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r setting up workspace}
+# ======================================================================
+# 00. SETUP
+# ======================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(purrr)
+  library(glue)
+  library(IPDfromKM)
+  library(survival)
+})
+
+set.seed(42)
+
+options(
+  stringsAsFactors = FALSE,
+  dplyr.summarise.inform = FALSE
+)
+```
+
+
+```{r}
+
+# ======================================================================
+# 01. CONFIGURATION
+# ======================================================================
+rm(list = ls())
+
+excel_path <- "data/extracted_points.xlsx"
+
+# Output directory for saved IPDs
+out_dir <- "data/reconstructed_ipd"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Map sheets to endpoint names (as you described)
+endpoints <- tibble::tibble(
+  sheet = 1:4,
+  endpoint = c(
+    "MD_RSV_LRTI",      # Sheet 1: Medically attended RSV-LRTI (Simões 2023)
+    "RSV_Hospitalization", # Sheet 2 : RSV hospitalization(Ho) (Simões 2023)
+    "Severe_RSV_LRTI",  # Sheet 3 : Severe RSV-LRTI (Kampmann 2023)
+    "Any_RSV_LRTI"      # Sheet 4 : RSV-LRTI (any) (Kampmann 2023)
+  )
+)
+
+time_cfg <- list(
+  MD_RSV_LRTI = list(
+    t_max  = 150,
+    trisk  = c(0, 30, 60, 90, 120, 150)
+  ),
+  RSV_Hospitalization = list(
+    t_max  = 150,
+    trisk  = c(0, 30, 60, 90, 120, 150)
+  ),
+  Severe_RSV_LRTI = list(
+    t_max  = 180,
+    trisk  = c(0, 30, 60, 90, 120, 150, 180)
+  ),
+  Any_RSV_LRTI = list(
+    t_max  = 180,
+    trisk  = c(0, 30, 60, 90, 120, 150, 180)
+  )
+)
+
+risk_tables <- list(
+  MD_RSV_LRTI = list(
+    placebo    = c(786, 772, 756, 737, 729, 724),
+    nirsevimab = c(1564, 1553, 1546, 1538, 1527, 1519)
+  ),
+  RSV_Hospitalization = list(
+    placebo    = c(786, 778, 769, 761, 757, 753),
+    nirsevimab = c(1564, 1554, 1547, 1540, 1535, 1529)
+  ),
+  Severe_RSV_LRTI = list(
+    placebo    = c(3480,3292,2973,2899,2833,2776,2749),
+    nirsevimab = c(3495, 3349, 3042, 2981, 2916, 2867, 2820)
+  ),
+  Any_RSV_LRTI = list(
+    placebo    = c(3480,3288, 2964, 2879, 2804, 2738, 2700),
+    nirsevimab = c(3495,3348, 3035, 2968, 2898, 2845, 2792)
+  )
+)
+
+arm_map <- c(
+  "placebo" = "placebo",
+  "rsvpref" = "nirsevimab",   # Kampmann label
+  "rsvpref " = "nirsevimab",  # defensive
+  "rsvprefv" = "nirsevimab"   
+)
+
+
+```
+
+
+```{r}
+
+# ======================================================================
+# 02. UTILITIES / VALIDATION
+# ======================================================================
+
+stop_if <- function(cond, msg) {
+  if (isTRUE(cond)) stop(msg, call. = FALSE)
+}
+
+inform <- function(...) message(glue::glue(..., .envir = parent.frame()))
+
+standardize_km_columns <- function(df) {
+  # Accept common column names and standardize to: time, surv, treat
+  # You have: time, proportion, treat
+  nm <- names(df)
+
+  # time
+  time_col <- nm[str_to_lower(nm) %in% c("time", "t", "days", "day")]
+  stop_if(length(time_col) != 1, "Could not uniquely identify time column.")
+
+  # survival/proportion
+  surv_col <- nm[str_to_lower(nm) %in% c("surv", "survival", "proportion", "s")]
+  stop_if(length(surv_col) != 1, "Could not uniquely identify survival/proportion column.")
+
+  # treat/arm
+  treat_col <- nm[str_to_lower(nm) %in% c("treat", "arm", "group", "trt")]
+  stop_if(length(treat_col) != 1, "Could not uniquely identify treatment/arm column.")
+
+  df |>
+    transmute(
+      time  = as.numeric(.data[[time_col]]),
+      surv  = as.numeric(.data[[surv_col]]),
+      treat = as.character(.data[[treat_col]])
+    )
+}
+
+clean_km_arm <- function(df_arm, time_round = 2) {
+  df_arm |>
+    filter(!is.na(time), !is.na(surv)) |>
+    transmute(
+      time = as.numeric(time),
+      surv = as.numeric(surv)
+    ) |>
+    mutate(
+      time = pmax(time, 0),                  # clamp negative time
+      time = round(time, time_round),        # reduce digitization jitter
+      surv = pmin(pmax(surv, 0), 1)          # clamp survival
+    ) |>
+    bind_rows(tibble::tibble(time = 0, surv = 1)) |>
+    arrange(time) |>
+    group_by(time) |>
+    summarise(surv = min(surv), .groups = "drop") |>  # step-like
+    mutate(surv = cummin(surv))                          # enforce non-increasing
+}
+
+km_critical_checks <- function(km_df, endpoint, t_max) {
+  # Data-level checks before splitting arms
+  stop_if(nrow(km_df) < 10, glue("[{endpoint}] Too few digitized points (<10)."))
+
+  stop_if(any(!is.finite(km_df$time)), glue("[{endpoint}] Non-finite time values found."))
+  stop_if(any(!is.finite(km_df$surv)), glue("[{endpoint}] Non-finite survival values found."))
+ 
+ if (any(km_df$time < 0, na.rm = TRUE)) {
+  n_bad <- sum(km_df$time < 0, na.rm = TRUE)
+  min_time <- suppressWarnings(min(km_df$time, na.rm = TRUE))
+  warning(glue::glue(
+    "[{endpoint}] {n_bad} time values < 0 detected (min={round(min_time, 6)}). ",
+    "They will be clamped to 0 during cleaning."
+  ), call. = FALSE)
+}
+
+
+  if (any(km_df$surv < 0 | km_df$surv > 1, na.rm = TRUE)) {
+  n_bad1 <- sum(km_df$surv < 0 | km_df$surv > 1, na.rm = TRUE)
+  max_over1 <- suppressWarnings(max(km_df$surv - 1, na.rm = TRUE))
+  min_under1 <- suppressWarnings(min(km_df$surv, na.rm = TRUE))
+  warning(glue::glue(
+    "[{endpoint}] {n_bad1} survival values outside [0,1] detected (min={round(min_under1,6)}, max_over_1={round(max_over1,6)}). ",
+    "They will be clamped to [0,1] during cleaning."
+  ), call. = FALSE)
+}
+
+
+  # Check for presence of both arms
+  arms <- sort(unique(km_df$treat))
+  stop_if(length(arms) < 2, glue("[{endpoint}] Only one arm detected in treat column: {toString(arms)}"))
+
+  # Inform about time coverage
+  inform("[{endpoint}] digitized time range: {min(km_df$time, na.rm=TRUE)} to {max(km_df$time, na.rm=TRUE)} (target max = {t_max})")
+
+  # Arm monotonicity check (raw)
+  mono <- km_df |>
+    group_by(treat) |>
+    arrange(time) |>
+    summarise(
+      n_increases = sum(diff(surv) > 0, na.rm = TRUE),
+      max_increase = suppressWarnings(max(diff(surv), na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  mono
+}
+
+ensure_tmax <- function(df_arm, t_max) {
+  # Ensure curve extends to t_max (required for consistent preprocessing)
+  df_arm <- df_arm |> filter(time <= t_max)
+
+  if (!any(abs(df_arm$time - t_max) < 1e-10)) {
+    last <- df_arm |> slice_tail(n = 1)
+    df_arm <- bind_rows(df_arm, mutate(last, time = t_max))
+  }
+  df_arm
+}
+
+validate_risk_table <- function(endpoint, trisk, risk_entry) {
+  stop_if(any(is.na(risk_entry$placebo)) || any(is.na(risk_entry$nirsevimab)),
+          glue("[{endpoint}] Risk table missing. Fill risk_tables[['{endpoint}']]."))
+
+  stop_if(length(risk_entry$placebo) != length(trisk),
+          glue("[{endpoint}] placebo nrisk length != length(trisk)."))
+
+  stop_if(length(risk_entry$nirsevimab) != length(trisk),
+          glue("[{endpoint}] nirsevimab nrisk length != length(trisk)."))
+
+  stop_if(any(diff(risk_entry$placebo) > 0),
+          glue("[{endpoint}] placebo nrisk increases over time (should be non-increasing)."))
+
+  stop_if(any(diff(risk_entry$nirsevimab) > 0),
+          glue("[{endpoint}] nirsevimab nrisk increases over time (should be non-increasing)."))
+}
+
+```
+
+
+```{r}
+
+# ======================================================================
+# 03. RECONSTRUCTION CORE (ONE ENDPOINT)
+# ======================================================================
+
+reconstruct_one_endpoint <- function(excel_path, sheet, endpoint, time_cfg, risk_tables, arm_map) {
+
+  inform("============================================================")
+  inform("Endpoint: {endpoint} (sheet {sheet})")
+  inform("============================================================")
+
+  cfg <- time_cfg[[endpoint]]
+    stop_if(is.null(cfg), glue("[{endpoint}] Missing time_cfg entry."))
+
+    t_max <- cfg$t_max
+    trisk <- cfg$trisk
+
+  # 1) Load raw
+  raw <- read_excel(excel_path, sheet = sheet) |>
+  standardize_km_columns() |>
+  mutate(
+    treat = str_to_lower(str_trim(treat)),
+    treat = str_replace_all(treat, "\\s+", ""),   # remove spaces inside (e.g., "RSV preF")
+    treat = recode(treat, !!!arm_map)
+  )
+
+raw <- raw |>
+  mutate(
+    time = pmax(time, 0),
+    surv = pmin(pmax(surv, 0), 1)
+  )
+
+stop_if(any(is.na(raw$treat)), glue("[{endpoint}] Unmapped treat labels found. Check arm_map."))
+
+
+  # 2) Critical checks (raw)
+  mono_raw <- km_critical_checks(raw, endpoint, t_max)
+  inform("[{endpoint}] Raw monotonicity check:")
+  print(mono_raw)
+
+  # 3) Split + clean each arm
+    km_p <- raw |> filter(treat == "placebo")    |> clean_km_arm() |> ensure_tmax(t_max)
+    km_n <- raw |> filter(treat == "nirsevimab") |> clean_km_arm() |> ensure_tmax(t_max)
+
+
+  stop_if(nrow(km_p) < 5, glue("[{endpoint}] Placebo curve too sparse after cleaning."))
+  stop_if(nrow(km_n) < 5, glue("[{endpoint}] Nirsevimab curve too sparse after cleaning."))
+
+  # 4) Validate risk table
+  risk_entry <- risk_tables[[endpoint]]
+  stop_if(is.null(risk_entry), glue("[{endpoint}] No risk table entry found in risk_tables list."))
+  validate_risk_table(endpoint, trisk, risk_entry)
+
+  # 5) Preprocess + reconstruct IPD
+  pre_p <- preprocess(dat = km_p, trisk = trisk, nrisk = risk_entry$placebo,    maxy = 1)
+  pre_n <- preprocess(dat = km_n, trisk = trisk, nrisk = risk_entry$nirsevimab, maxy = 1)
+
+  est_p <- getIPD(prep = pre_p, armID = 0)
+  est_n <- getIPD(prep = pre_n, armID = 1)
+
+  ipd <- bind_rows(
+    est_p$IPD |> mutate(treat = "placebo"),
+    est_n$IPD |> mutate(treat = "nirsevimab")
+  ) |>
+    mutate(
+      treat  = factor(treat, levels = c("placebo", "nirsevimab")),
+      time   = as.numeric(time),
+      status = as.integer(status),
+      endpoint = endpoint
+    )
+
+  # 6) IPD diagnostics summary
+  diag <- list(
+    precision_placebo = est_p$precision,
+    precision_nirsev  = est_n$precision,
+    ks_placebo = est_p$kstest,
+    ks_nirsev  = est_n$kstest,
+    n_by_arm = table(ipd$treat),
+    events_by_arm = table(ipd$treat, ipd$status),
+    time_summary = summary(ipd$time)
+  )
+
+  inform("[{endpoint}] N by arm:")
+  print(diag$n_by_arm)
+  inform("[{endpoint}] Events by arm (status=1 is event):")
+  print(diag$events_by_arm)
+
+  # 7) Visual check: reconstructed KM vs digitized points (per arm)
+  fit <- survfit(Surv(time, status) ~ treat, data = ipd)
+
+  sf <- data.frame(
+    time = fit$time,
+    surv = fit$surv,
+    treat = rep(names(fit$strata), fit$strata)
+  ) |>
+    mutate(treat = sub("treat=", "", treat))
+
+  dig <- bind_rows(
+    km_p |> mutate(treat = "placebo"),
+    km_n |> mutate(treat = "nirsevimab")
+  )
+
+  p_overlay <- ggplot() +
+    geom_step(data = sf, aes(x = time, y = surv, colour = treat), linewidth = 0.9) +
+    geom_point(data = dig, aes(x = time, y = surv, colour = treat), alpha = 0.35, size = 1) +
+    facet_wrap(~treat) +
+    labs(
+      x = "Days since dose",
+      y = glue("Survival (no {endpoint})"),
+      colour = "Treatment",
+      title = glue("KM overlay: reconstructed IPD vs digitized points ({endpoint})")
+    ) +
+    theme_bw()
+
+  # 8) Save IPD + metadata bundle
+  bundle <- list(
+    endpoint = endpoint,
+    sheet = sheet,
+    t_max = t_max,
+    trisk = trisk,
+    nrisk = risk_entry,
+    km_clean = list(placebo = km_p, nirsevimab = km_n),
+    ipd = ipd,
+    diagnostics = diag,
+    est = list(placebo = est_p, nirsevimab = est_n)
+  )
+
+  list(bundle = bundle, plot = p_overlay)
+}
+
+```
+
+```{r}
+#endpoints1 <- endpoints |>
+#    filter(sheet == 4)
+```
+
+```{r}
+
+# ======================================================================
+# 04. RUN ALL ENDPOINTS + SAVE
+# ======================================================================
+
+results <- endpoints |>
+  mutate(
+    out_rds = file.path(out_dir, paste0(endpoint, ".rds"))
+  ) |>
+  pmap(function(sheet, endpoint, out_rds) {
+
+    res <- reconstruct_one_endpoint(
+        excel_path   = excel_path,
+        sheet        = sheet,
+        endpoint     = endpoint,
+        time_cfg     = time_cfg,
+        risk_tables  = risk_tables,
+        arm_map      = arm_map
+)
+
+    # Save the FULL bundle (IPD + cleaned KM + metadata + diagnostics)
+    saveRDS(res$bundle, out_rds)
+    inform("Saved: {out_rds}")
+
+    # Return minimal object
+    list(endpoint = endpoint, out_rds = out_rds, plot = res$plot)
+  })
+
+# Print paths
+tibble::tibble(
+  endpoint = map_chr(results, "endpoint"),
+  out_rds  = map_chr(results, "out_rds")
+)
+
+```
+
+
+```{r}
+# ======================================================================
+# 05. POST-RUN CHECKS
+# ======================================================================
+
+# Show overlay plots (one by one)
+walk(results, ~print(.x$plot))
+
+# Example: read one saved IPD bundle
+md_bundle <- readRDS(file.path(out_dir, "Any_RSV_LRTI.rds"))
+
+# Access reconstructed IPD
+ipd_md <- md_bundle$ipd
+
+# Cox model (example)
+cox_md <- coxph(Surv(time, status) ~ treat, data = ipd_md)
+summary(cox_md)
+
+
+```

@@ -1,0 +1,635 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r loading packages}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(survival)
+  library(tibble)
+  library(readr)  
+  library(tidyverse)  
+  library(cmdstanr)
+})
+```
+
+```{r loading data}
+rm(list = ls())
+source("methods/dtest.R")
+
+set.seed(42)
+bundle_path <- "data/reconstructed_ipd/MD_RSV_LRTI.rds" 
+
+bundle <- readRDS(bundle_path)
+
+stopifnot(is.list(bundle))
+
+stopifnot("ipd" %in% names(bundle))
+
+ipd_df <- bundle$ipd
+
+str(ipd_df)
+head(ipd_df)
+```
+
+
+```{r}
+# ======================================================================
+# 02. BASIC QC (BEFORE DURHAM)
+# ======================================================================
+
+stopifnot(all(c("time", "status", "treat") %in% names(ipd_df)))
+
+ipd_df |>
+  summarise(
+    n = n(),
+    events = sum(status == 1, na.rm = TRUE),
+    time_min = min(time, na.rm = TRUE),
+    time_max = max(time, na.rm = TRUE),
+    n_missing = sum(is.na(time) | is.na(status) | is.na(treat))
+  ) |>
+  print()
+
+
+ipd_df |>
+  count(treat, status) |>
+  tidyr::pivot_wider(names_from = status, values_from = n, values_fill = 0) |>
+  print()
+
+
+unique(ipd_df$treat)
+```
+
+
+```{r}
+# ======================================================================
+# 03. PREP DATA (Durham toolkit)
+# ======================================================================
+
+dat <- durham_prep_data(
+  data = ipd_df,
+  time_col = "time",
+  status_col = "status",
+  treat_col = "treat",
+  ref_level = "placebo",
+  vax_level = "nirsevimab"
+)
+
+levels(dat$treat)
+
+```
+
+```{r}
+# ======================================================================
+# 04. OVERALL COX MODEL (Durham toolkit)
+# ======================================================================
+cox_sum <- durham_fit_cox(dat)
+
+cat("\n==================== OVERALL COX SUMMARY ====================\n")
+cat("N:      ", cox_sum$n, "\n")
+cat("Events: ", cox_sum$events, "\n")
+cat("HR:     ", signif(cox_sum$hr, 5), "\n")
+cat("VE(%):  ", round(cox_sum$ve, 2), "\n")
+cat("=============================================================\n\n")
+
+
+summary(cox_sum$fit)
+```
+
+```{r}
+
+# ======================================================================
+# 05. PH / WANING TEST (Grambsch–Therneau via cox.zph)
+# ======================================================================
+ph <- durham_ph_test(cox_sum$fit, transform = "identity")
+
+cat("\n==================== PH TEST (cox.zph) =======================\n")
+cat("p_treat:  ", signif(ph$p_treat, 4), "\n")
+cat("p_global: ", signif(ph$p_global, 4), "\n")
+cat("=============================================================\n\n")
+
+print(ph$zph$table)
+
+plot(ph$zph, resid = FALSE)
+abline(h = 0, lty = 2)
+
+```
+
+```{r}
+# ======================================================================
+# 06. DURHAM CURVE (time-varying beta(t), HR(t), VE(t))
+# ======================================================================
+
+main <- durham_curve(
+  dat,
+  smooth = "loess",
+  span = 0.75,
+  zph_transform = "identity"
+)
+
+# The curve you’ll use for plotting/inspection:
+curve_main <- main$curve
+head(curve_main)
+
+# Optional: inspect the residual process used to construct beta(t)
+head(main$residual_process)
+
+```
+
+```{r}
+# ======================================================================
+# 07. BOOTSTRAP BANDS (pointwise 95% CI)
+# ======================================================================
+boot <- durham_bootstrap_bands(
+  dat,
+  t_grid = curve_main$time,
+  B = 500,
+  smooth = "loess",
+  span = 0.75,
+  zph_transform = "identity",
+  seed = 42
+)
+
+cat("\n==================== BOOTSTRAP ===============================\n")
+cat("B requested: ", 500, "\n")
+cat("Successful replicates (non-empty): ", boot$n_success, "\n")
+cat("=============================================================\n\n")
+
+# Merge bootstrap bands with the main curve
+curve_ci <- curve_main |>
+  mutate(
+    VE_lower = boot$ve_lower,
+    VE_upper = boot$ve_upper
+  )
+
+# Quick look at uncertainty width
+curve_ci |>
+  summarise(
+    mean_width = mean(VE_upper - VE_lower, na.rm = TRUE),
+    max_width  = max(VE_upper - VE_lower, na.rm = TRUE)
+  ) |>
+  print()
+
+```
+
+```{r}
+# ======================================================================
+# 07. Log log plot
+# ======================================================================
+
+
+km_fit <- survfit(
+  Surv(time, status) ~ treat,
+  data = ipd_df
+)
+
+km_df <- data.frame(
+  time  = km_fit$time,
+  surv  = km_fit$surv,
+  treat = rep(names(km_fit$strata), km_fit$strata)
+)
+
+km_df$treat <- sub("treat=", "", km_df$treat)
+
+# Avoid log(0)
+km_df <- km_df %>%
+  dplyr::filter(surv > 0)
+
+ggplot(km_df, aes(
+  x = log(time),
+  y = log(-log(surv)),
+  colour = treat
+)) +
+  geom_step(direction = "hv", linewidth = 1) +
+  labs(
+    x = "log(Time)",
+    y = "log(-log(Survival))",
+    colour = "Treatment",
+    title = "Log(-log) survival plot for PH assessment"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+
+# ======================================================================
+# 08. ONE-SHOT RUN 
+# ======================================================================
+res <- durham_waning_analysis(
+  data = ipd_df,
+  time_col = "time",
+  status_col = "status",
+  treat_col = "treat",
+  ref_level = "placebo",
+  vax_level = "nirsevimab",
+  smooth = "loess",
+  span = 0.75,
+  zph_transform = "identity",
+  B = 500,
+  seed = 42
+)
+
+# Print key results
+cat("\n==================== DURHAM ONE-SHOT =========================\n")
+cat("HR:     ", signif(res$cox$hr, 5), "\n")
+cat("VE(%):  ", round(res$cox$ve, 2), "\n")
+cat("Events: ", res$cox$events, "\n")
+cat("PH p_treat:  ", signif(res$ph$p_treat, 4), "\n")
+cat("PH p_global: ", signif(res$ph$p_global, 4), "\n")
+cat("Bootstrap success: ", res$bootstrap$n_success, "\n")
+cat("=============================================================\n\n")
+
+summary(res$curve$VE_t)
+
+
+```
+
+```{r}
+# ======================================================================
+# 09. PLOTS (Durham VE(t) with CI bands)
+# ======================================================================
+
+print(plot_durham_ve(res))
+#print(plot_durham_ve(res, ylim = c(50, 100)))
+```
+
+
+
+```{r}
+dat <- durham_prep_data(ipd_df)
+
+main_spl <- durham_curve_spline(dat, spline="ns", df=3)
+boot_spl <- durham_bootstrap_bands_spline(dat, t_grid=main_spl$curve$time, B=500, spline="ns", df=3)
+
+curve_ci <- main_spl$curve %>%
+  mutate(VE_lower = boot_spl$ve_lower,
+         VE_upper = boot_spl$ve_upper)
+
+```
+
+```{r}
+dat <- durham_prep_data(ipd_df)
+dte <- durham_bootstrap_bands_moutofn(dat) 
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# 1) Main Durham curve on the same grid as the bootstrap
+main <- durham_curve(
+  dat,
+  t_grid = dte$t_grid,      # ensure same grid
+  smooth = "loess",
+  span = 0.75,
+  zph_transform = "identity"
+)
+
+# 2) Merge main curve + m-out-of-n CI bands
+curve_ci <- main$curve %>%
+  mutate(
+    VE_lower = dte$ve_lower,
+    VE_upper = dte$ve_upper
+  )
+
+# (optional) clamp for nicer plotting (prevents wild negatives)
+curve_ci <- curve_ci %>%
+  mutate(
+    VE_lower = pmax(VE_lower, -100),
+    VE_upper = pmin(VE_upper,  100),
+    VE_t     = pmin(pmax(VE_t, -100), 100)
+  )
+
+# 3) Plot
+ggplot(curve_ci, aes(x = time, y = VE_t)) +
+  geom_ribbon(aes(ymin = VE_lower, ymax = VE_upper), alpha = 0.25) +
+  geom_line(linewidth = 1) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Durham VE(t) with m-out-of-n bootstrap 95% bands",
+    subtitle = paste0("B=", dte$B, ", m_frac=", dte$m_frac),
+    x = "Days since dose",
+    y = "Vaccine efficacy (%)"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+# main curve already computed above: main$curve$VE_t
+
+sim <- bootstrap_simultaneous_bands(
+  main_vec = main$curve$VE_t,
+  boot_mat = dte$boot_mat,
+  level = 0.95
+)
+
+curve_ci2 <- main$curve %>%
+  mutate(
+    VE_lower_sim = sim$lower,
+    VE_upper_sim = sim$upper
+  ) %>%
+  mutate(
+    VE_lower_sim = pmax(VE_lower_sim, -100),
+    VE_upper_sim = pmin(VE_upper_sim,  100),
+    VE_t         = pmin(pmax(VE_t, -100), 100)
+  )
+
+ggplot(curve_ci2, aes(x = time, y = VE_t)) +
+  geom_ribbon(aes(ymin = VE_lower_sim, ymax = VE_upper_sim), alpha = 0.25) +
+  geom_line(linewidth = 1) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Durham VE(t) with simultaneous 95% band (m-out-of-n bootstrap)",
+    subtitle = paste0("Band uses max|deviation|; B=", sim$n_success, ", m_frac=", dte$m_frac),
+    x = "Days since dose",
+    y = "Vaccine efficacy (%)"
+  ) +
+  theme_bw()
+
+```
+
+# ---------------------------------------------------------------
+# TDC (Time-Dependent Coefficient) MODEL
+# ---------------------------------------------------------------
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(survival)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(readr)  
+})
+
+set.seed(42)
+options(stringsAsFactors = FALSE)
+
+source("methods/tdc.R")
+
+bundle_path <- "data/reconstructed_ipd/MD_RSV_LRTI.rds"   
+
+bundle <- readRDS(bundle_path)
+stopifnot(is.list(bundle), "ipd" %in% names(bundle))
+
+ipd_df <- bundle$ipd
+
+# Quick structure checks
+stopifnot(all(c("time", "status", "treat") %in% names(ipd_df)))
+str(ipd_df)
+head(ipd_df)
+
+# ======================================================================
+# 02. BASIC QC (before modeling)
+# ======================================================================
+qc <- ipd_df |> 
+  summarise(
+    n = n(),
+    events = sum(status == 1, na.rm = TRUE),
+    time_min = min(time, na.rm = TRUE),
+    time_max = max(time, na.rm = TRUE),
+    n_missing = sum(is.na(time) | is.na(status) | is.na(treat))
+  )
+print(qc)
+
+# Events by arm
+ipd_df %>%
+  count(treat, status) %>%
+  tidyr::pivot_wider(names_from = status, values_from = n, values_fill = 0) %>%
+  print()
+
+# Confirm treatment labels present
+print(unique(ipd_df$treat))
+
+# ======================================================================
+# 03. TDC: MAIN ONE-SHOT ANALYSIS (recommended workflow)
+# ======================================================================
+# Key knobs:
+# - eps: avoids log(0). Use small value (e.g., 1e-3 days) or (better) 0.5 days.
+# - B: bootstrap replicates
+# - seed: reproducibility
+ref_level <- "placebo"
+vax_level <- "nirsevimab"
+
+B    <- 500
+seed <- 42
+eps  <- 1e-3
+
+res_tdc <- tdc_logt_analysis(
+  data       = ipd_df,
+  time_col   = "time",
+  status_col = "status",
+  treat_col  = "treat",
+  ref_level  = ref_level,
+  vax_level  = vax_level,
+  B          = B,
+  seed       = seed,
+  eps        = eps
+)
+
+# ======================================================================
+# 04. PRINT MODEL OUTPUT (b0, b1) + INTERPRETATION HELPERS
+# ======================================================================
+fit_obj <- res_tdc$fit_obj
+
+cat("\n==================== TDC MODEL (log time interaction) ====================\n")
+cat("Endpoint file: ", bundle_path, "\n")
+cat("N:            ", nrow(fit_obj$data), "\n")
+cat("Events:       ", sum(fit_obj$data$status), "\n")
+cat("eps:          ", fit_obj$eps, "\n\n")
+
+cat("b0 (main vax effect):     ", signif(fit_obj$coef["b0"], 6), "\n")
+cat("b1 (vax * log(time)):     ", signif(fit_obj$coef["b1"], 6), "\n")
+cat("Interpretation:\n")
+cat("  log HR(t) = b0 + b1*log(t)\n")
+cat("  If b1 > 0: HR(t) increases with time => VE wanes\n")
+cat("  If b1 < 0: HR(t) decreases with time => VE increases\n")
+cat("==========================================================================\n\n")
+
+# Full Cox summary (includes p-values for b0 and tt(vax))
+summary(fit_obj$fit)
+
+# ======================================================================
+# 05. TDC PREDICTIONS AT SPECIFIC TIMES (report-friendly)
+# ======================================================================
+# Pick clinically meaningful time points (days)
+times_report <- c(7, 30, 60, 90, 120, 150)
+
+pred_report <- tdc_predict_logt(fit_obj, t_grid = times_report)
+
+cat("\n==================== VE(t) at selected times ============================\n")
+print(pred_report)
+cat("==========================================================================\n\n")
+
+# Optional: add to a neat table
+pred_report %>%
+  mutate(
+    HR_t = round(HR_t, 3),
+    VE_t = round(VE_t, 1)
+  ) %>%
+  print(n = Inf)
+
+# ======================================================================
+# 06. BOOTSTRAP DIAGNOSTICS
+# ======================================================================
+boot <- res_tdc$boot
+cat("\n==================== BOOTSTRAP ===============================\n")
+cat("B requested: ", B, "\n")
+cat("Replicates with any output (current counter): ", boot$n_success, "\n")
+cat("NOTE: This counter is lenient (counts partial outputs). For strict success,\n")
+cat("      use: sum(colSums(is.na(boot$boot_mat)) == 0)\n")
+cat("=============================================================\n\n")
+
+n_success_full <- sum(colSums(is.na(boot$boot_mat)) == 0)
+cat("Strict full-grid successes: ", n_success_full, " / ", B, "\n\n")
+
+# ======================================================================
+# 07. PLOT VE(t) WITH BOOTSTRAP BANDS
+# ======================================================================
+print(plot_tdc_logt(res_tdc, ylim = c(0, 100)))
+print(plot_tdc_logt(res_tdc, ylim = c(50, 100)))
+
+# Optional: save plots
+# ggsave("tdc_ve_full.png", plot = plot_tdc_logt(res_tdc, ylim = c(0, 100)),
+#        width = 8, height = 5, dpi = 300)
+# ggsave("tdc_ve_zoom.png", plot = plot_tdc_logt(res_tdc, ylim = c(50, 100)),
+#        width = 8, height = 5, dpi = 300)
+
+# ======================================================================
+# 08. COMPARE TDC vs CONSTANT HR COX (sanity check)
+# ======================================================================
+# Constant HR model:
+fit_const <- coxph(Surv(time, status) ~ treat, data = fit_obj$data, ties = "efron")
+hr_const  <- unname(exp(coef(fit_const))[1])
+ve_const  <- (1 - hr_const) * 100
+
+cat("\n==================== SANITY CHECK ============================\n")
+cat("Constant Cox HR: ", signif(hr_const, 5), " (VE=", round(ve_const, 1), "%)\n")
+cat("TDC model b0,b1:  ", round(fit_obj$coef["b0"], 4), ", ", round(fit_obj$coef["b1"], 4), "\n")
+cat("If b1 is near 0, TDC reduces to constant HR.\n")
+cat("=============================================================\n\n")
+
+# Likelihood ratio comparison: constant vs time-dependent coefficient model
+# (Note: not nested in the strictest sense for partial likelihood with tt(),
+#  but this gives a useful indication; you can also compare AIC.)
+cat("AIC constant: ", AIC(fit_const), "\n")
+cat("AIC TDC:      ", AIC(fit_obj$fit), "\n\n")
+
+# ======================================================================
+# 09. EXPORT RESULTS (curve + model)
+# ======================================================================
+# Save analysis object
+out_rds <- "data/tdc_results_MD_RSV_LRTI.rds"  # <-- rename per endpoint
+saveRDS(res_tdc, out_rds)
+
+# Save curve as CSV for reporting
+out_csv <- "data/tdc_curve_MD_RSV_LRTI.csv"    # <-- rename per endpoint
+readr::write_csv(res_tdc$curve, out_csv)
+
+cat("Saved:\n")
+cat(" - ", out_rds, "\n")
+cat(" - ", out_csv, "\n")
+
+# ======================================================================
+# 10. OPTIONAL: BATCH RUN MULTIPLE ENDPOINTS
+# ======================================================================
+endpoint_files <- c(
+  "data/reconstructed_ipd/MD_RSV_LRTI.rds",
+  "data/reconstructed_ipd/RSV_Hospitalization.rds"
+  # Add others if you have them
+)
+
+batch <- lapply(endpoint_files, function(fp) {
+  b <- readRDS(fp)
+  ipd <- b$ipd
+
+  r <- tdc_logt_analysis(
+    data = ipd,
+    time_col = "time", status_col = "status", treat_col = "treat",
+    ref_level = ref_level, vax_level = vax_level,
+    B = B, seed = seed, eps = eps
+  )
+
+  # summary row
+  b0 <- r$fit_obj$coef["b0"]
+  b1 <- r$fit_obj$coef["b1"]
+
+  # VE at 150 days for comparability
+  ve150 <- tdc_predict_logt(r$fit_obj, t_grid = 150)$VE_t
+
+  tibble(
+    endpoint = if ("endpoint" %in% names(b)) b$endpoint else basename(fp),
+    n = nrow(r$fit_obj$data),
+    events = sum(r$fit_obj$data$status),
+    b0 = as.numeric(b0),
+    b1 = as.numeric(b1),
+    ve_150 = as.numeric(ve150),
+    aic = AIC(r$fit_obj$fit)
+  )
+})
+
+batch_summary <- bind_rows(batch)
+print(batch_summary)
+
+# Optional export
+# readr::write_csv(batch_summary, "data/tdc_batch_summary.csv")
+
+################################################################################
+# END
+################################################################################
+
+```
+
+# --------------------------------
+# Logistic
+# -------------------------------
+
+```{r}
+source("methods/logistic.R")
+
+res_logit <- logit_tdc_analysis(
+  data = ipd_df,
+  time_col = "time", 
+  status_col = "status",
+  treat_col = "treat"
+
+   )
+```
+
+
+
+```{r}
+library(rstan)
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+source("methods/bayesian.R")
+
+pp_obj <- pp_make(ipd_df, dt = 7)
+
+fit_stan <- fit_bayes_stan(
+  pp_obj,
+  df_baseline = 8,
+  df_waning = 6,
+  iter = 4000, warmup = 1500,
+  chains = 4, seed = 42
+)
+
+
+```
+
+```{r}
+print(fit_stan$fit, pars = c("alpha0","beta0","sigma_a","sigma_d"))
+```
+
+```{r}
+curve_stan <- extract_ve_curve_stan(fit_stan)
+print(plot_ve_stan(curve_stan))
+```

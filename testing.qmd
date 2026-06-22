@@ -1,0 +1,41 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r}
+rm(list = ls())
+source("validation.R")
+```
+
+
+```{r}
+severe <- readRDS("data/reconstructed_ipd/Severe_RSV_LRTI.rds")
+```
+
+
+```{r}
+severe$ipd
+```
+
+
+```{r}
+plot(severe$est$nirsevimab)
+severe$diagnostics$precision_nirsev
+severe$diagnostics$ks_nirsev
+```
+
+```{r}
+kampann_plot(
+    ipd = s_ipd,
+    arm_levels = c("placebo", "RSVpreF"),
+    title = "Kampmann 2023: Severe RSV-LRTI"
+) 
+
+```
+
+
+```{r}
+event_count_validation(severe)$nirsevimab
+```
